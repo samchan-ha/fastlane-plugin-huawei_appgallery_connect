@@ -150,21 +150,26 @@ module Fastlane
         else
           UI.important('Uploading app')
           # Upload App
-          boundary = "755754302457647"
           uri = URI(result_json['urlInfo']['url'])
-          # uri = URI("http://localhost/dashboard/test")
           http = Net::HTTP.new(uri.host, uri.port)
           http.use_ssl = true
           request = Net::HTTP::Put.new(uri)
-          request["Authorization"] = result_json['urlInfo']['headers']['Authorization']
-          request["Content-Type"] = result_json['urlInfo']['headers']['Content-Type']
-          request["user-agent"] = result_json['urlInfo']['headers']['user-agent']
-          request["Host"] = result_json['urlInfo']['headers']['Host']
-          request["x-amz-date"] = result_json['urlInfo']['headers']['x-amz-date']
+          request["Authorization"]        = result_json['urlInfo']['headers']['Authorization']
+          request["Content-Type"]         = result_json['urlInfo']['headers']['Content-Type']
+          request["user-agent"]           = result_json['urlInfo']['headers']['user-agent']
+          request["Host"]                 = result_json['urlInfo']['headers']['Host']
+          request["x-amz-date"]           = result_json['urlInfo']['headers']['x-amz-date']
           request["x-amz-content-sha256"] = result_json['urlInfo']['headers']['x-amz-content-sha256']
-
-          request.body = File.read(apk_path.to_s)
+          # Explicitly set Content-Length so the pre-signed OBS/S3 URL signature check passes
+          # for large files. Without this, Ruby's Net::HTTP may compute a wrong length for
+          # binary data when the body is set as a String, causing a 403 Forbidden response.
+          request["Content-Length"]       = file_size_in_bytes.to_s
           request.content_type = 'application/octet-stream'
+
+          # Stream the file body instead of loading the entire file into memory.
+          # File.read would buffer the whole APK/AAB as a Ruby String, which is both
+          # memory-inefficient and can produce a Content-Length mismatch on binary files.
+          request.body_stream = File.open(apk_path.to_s, 'rb')
 
           result = http.request(request)
           if !result.kind_of? Net::HTTPSuccess
