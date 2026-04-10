@@ -106,23 +106,32 @@ module Fastlane
       end
 
 
+      # Files larger than this threshold are uploaded via the multipart API.
+      # Huawei's OBS pre-signed single-PUT URL fails with 403 for large payloads,
+      # so we switch to the multipart flow (init → chunk URLs → upload → merge).
+      MULTIPART_UPLOAD_THRESHOLD = 20 * 1024 * 1024  # 20 MB
+      # Each chunk is 10 MB — safely between Huawei's 5 MB min and 100 MB max.
+      MULTIPART_CHUNK_SIZE = 10 * 1024 * 1024         # 10 MB
+
       def self.upload_app(token, client_id, app_id, apk_path, is_aab)
+        file_size_in_bytes = File.size(apk_path.to_s)
+        upload_filename = is_aab ? "release.aab" : "release.apk"
+
+        if file_size_in_bytes > MULTIPART_UPLOAD_THRESHOLD
+          UI.important("File size #{(file_size_in_bytes / 1024.0 / 1024.0).round(1)} MB exceeds #{MULTIPART_UPLOAD_THRESHOLD / 1024 / 1024} MB threshold — using multipart upload")
+          return upload_app_multipart(token, client_id, app_id, apk_path, upload_filename, file_size_in_bytes)
+        end
+
         UI.message("Fetching upload URL")
 
         responseData = JSON.parse("{}")
         responseData["success"] = false
         responseData["code"] = 0
 
-        file_size_in_bytes = File.size(apk_path.to_s)
         sha256 = Digest::SHA256.file(apk_path).hexdigest
 
-        if(is_aab)
-          uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload-url/for-obs?appId=#{app_id}&fileName=release.aab&contentLength=#{file_size_in_bytes}&suffix=aab")
-          upload_filename = "release.aab"
-        else
-          uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload-url/for-obs?appId=#{app_id}&fileName=release.apk&contentLength=#{file_size_in_bytes}&suffix=apk")
-          upload_filename = "release.apk"
-        end
+        suffix = is_aab ? "aab" : "apk"
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload-url/for-obs?appId=#{app_id}&fileName=#{upload_filename}&contentLength=#{file_size_in_bytes}&suffix=#{suffix}")
 
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = true
@@ -160,16 +169,11 @@ module Fastlane
           request["Host"]                 = result_json['urlInfo']['headers']['Host']
           request["x-amz-date"]           = result_json['urlInfo']['headers']['x-amz-date']
           request["x-amz-content-sha256"] = result_json['urlInfo']['headers']['x-amz-content-sha256']
-          # Explicitly set Content-Length so the pre-signed OBS/S3 URL signature check passes
-          # for large files. Without this, Ruby's Net::HTTP may compute a wrong length for
-          # binary data when the body is set as a String, causing a 403 Forbidden response.
-          request["Content-Length"]       = file_size_in_bytes.to_s
+          # Use binread (ASCII-8BIT) so bytesize == file size and Content-Type is
+          # not mixed with character encoding issues. content_type must be set after
+          # body= otherwise Net::HTTP resets it.
+          request.body = File.binread(apk_path.to_s)
           request.content_type = 'application/octet-stream'
-
-          # Stream the file body instead of loading the entire file into memory.
-          # File.read would buffer the whole APK/AAB as a Ruby String, which is both
-          # memory-inefficient and can produce a Content-Length mismatch on binary files.
-          request.body_stream = File.open(apk_path.to_s, 'rb')
 
           result = http.request(request)
           if !result.kind_of? Net::HTTPSuccess
@@ -181,50 +185,184 @@ module Fastlane
 
           if result.code.to_i == 200
             UI.success('Upload app to AppGallery Connect successful')
-            UI.important("Saving app information")
-
-            uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/app-file-info?appId=#{app_id}")
-
-            http = Net::HTTP.new(uri.host, uri.port)
-            http.use_ssl = true
-            request = Net::HTTP::Put.new(uri.request_uri)
-            request["client_id"] = client_id
-            request["Authorization"] = "Bearer #{token}"
-            request["Content-Type"] = "application/json"
-
-            data = {fileType: 5, files: [{
-
-                fileName: upload_filename,
-                fileDestUrl: result_json['urlInfo']['objectId']
-                # size: result_json['result']['UploadFileRsp']['fileInfoList'][0]['size'].to_s
-
-            }] }.to_json
-
-            request.body = data
-            response = http.request(request)
-            if !response.kind_of? Net::HTTPSuccess
-              UI.user_error!("Cannot save app info, please check API Token / Permissions (status code: #{response.code})")
-              responseData["success"] = false
-              return responseData
-            end
-            result_json = JSON.parse(response.body)
-
-            if result_json['ret']['code'] == 0
-              UI.success("App information saved.")
-              responseData["success"] = true
-              responseData["pkgVersion"] = result_json["pkgVersion"][0]
-              return responseData
-            else
-              UI.user_error!(result_json)
-              UI.user_error!("Failed to save app information")
-              responseData["success"] = false
-              return responseData
-            end
+            return save_app_file_info(token, client_id, app_id, upload_filename, result_json['urlInfo']['objectId'], responseData)
           else
             responseData["success"] = false
             return responseData
           end
         end
+      end
+
+      # Multipart upload flow for files larger than MULTIPART_UPLOAD_THRESHOLD.
+      # Implements: init → get chunk URLs → upload each chunk → merge chunks → save file info.
+      def self.upload_app_multipart(token, client_id, app_id, apk_path, upload_filename, file_size_in_bytes)
+        responseData = JSON.parse("{}")
+        responseData["success"] = false
+        responseData["code"] = 0
+
+        # ── Step 1: Initialize multipart upload ──────────────────────────────
+        UI.message("Initializing multipart upload")
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload/multipart/init?appId=#{app_id}&fileName=#{upload_filename}")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        request = Net::HTTP::Post.new(uri.request_uri)
+        request["client_id"] = client_id
+        request["Authorization"] = "Bearer #{token}"
+        response = http.request(request)
+
+        if !response.kind_of? Net::HTTPSuccess
+          UI.user_error!("Cannot initialize multipart upload (status code: #{response.code}, body: #{response.body})")
+          return responseData
+        end
+
+        init_json = JSON.parse(response.body)
+        if init_json['ret']['code'] != 0
+          UI.user_error!("Multipart init failed: #{init_json}")
+          return responseData
+        end
+
+        object_id    = init_json['objectId']
+        nsp_upload_id = init_json['nspUploadId']
+        # Respect Huawei's minimum chunk size; default our preferred size if larger.
+        min_chunk = init_json['nspPartMinSize'] || (5 * 1024 * 1024)
+        chunk_size = [min_chunk, MULTIPART_CHUNK_SIZE].max
+        UI.success("Multipart upload initialized (objectId=#{object_id}, chunkSize=#{chunk_size / 1024 / 1024} MB)")
+
+        # ── Step 2: Calculate chunk layout ───────────────────────────────────
+        chunks = []
+        offset = 0
+        part_num = 1
+        while offset < file_size_in_bytes
+          chunk_len = [chunk_size, file_size_in_bytes - offset].min
+          chunks << { part_key: "additionalProp#{part_num}", offset: offset, length: chunk_len }
+          offset += chunk_len
+          part_num += 1
+        end
+
+        # ── Step 3: Obtain pre-signed upload URL for each chunk ───────────────
+        UI.message("Obtaining chunk upload URLs (#{chunks.size} chunks)")
+        parts_body = {}
+        chunks.each { |c| parts_body[c[:part_key]] = { length: c[:length] } }
+
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload/multipart/parts?objectId=#{CGI.escape(object_id)}&nspUploadId=#{CGI.escape(nsp_upload_id)}")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        request = Net::HTTP::Post.new(uri.request_uri)
+        request["client_id"] = client_id
+        request["Authorization"] = "Bearer #{token}"
+        request["Content-Type"] = "application/json"
+        request.body = parts_body.to_json
+        response = http.request(request)
+
+        if !response.kind_of? Net::HTTPSuccess
+          UI.user_error!("Cannot obtain chunk upload URLs (status code: #{response.code}, body: #{response.body})")
+          return responseData
+        end
+
+        parts_json = JSON.parse(response.body)
+        if parts_json['ret']['code'] != 0
+          UI.user_error!("Get chunk URLs failed: #{parts_json}")
+          return responseData
+        end
+
+        upload_info_map = parts_json['uploadInfoMap']
+
+        # ── Step 4: Upload each chunk ─────────────────────────────────────────
+        etag_map = {}
+        File.open(apk_path.to_s, 'rb') do |f|
+          chunks.each do |chunk|
+            part_key  = chunk[:part_key]
+            part_info = upload_info_map[part_key]
+            headers   = part_info['headers']
+
+            UI.message("Uploading #{part_key} (#{(chunk[:length] / 1024.0 / 1024.0).round(1)} MB)")
+            chunk_data = f.read(chunk[:length])
+
+            chunk_uri  = URI(part_info['url'])
+            chunk_http = Net::HTTP.new(chunk_uri.host, chunk_uri.port)
+            chunk_http.use_ssl = true
+            chunk_req  = Net::HTTP::Put.new(chunk_uri)
+            chunk_req["Authorization"]        = headers['Authorization']
+            chunk_req["x-amz-content-sha256"] = headers['x-amz-content-sha256']
+            chunk_req["x-amz-date"]           = headers['x-amz-date']
+            chunk_req["Host"]                 = headers['Host']
+            chunk_req["Content-Type"]         = headers['Content-Type']
+            chunk_req.body = chunk_data
+            chunk_req.content_type = 'application/octet-stream'
+
+            chunk_result = chunk_http.request(chunk_req)
+            if chunk_result.code.to_i != 200
+              UI.user_error!("Failed to upload #{part_key} (status code: #{chunk_result.code}, body: #{chunk_result.body})")
+              responseData["success"] = false
+              return responseData
+            end
+
+            etag = chunk_result['ETag']
+            UI.success("#{part_key} uploaded successfully (ETag: #{etag})")
+            etag_map[part_key] = { partObjectId: part_info['partObjectId'], etag: etag }
+          end
+        end
+
+        # ── Step 5: Merge all chunks into one file ────────────────────────────
+        UI.important("Merging #{chunks.size} chunks")
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload/multipart/compose?objectId=#{CGI.escape(object_id)}&nspUploadId=#{CGI.escape(nsp_upload_id)}")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        request = Net::HTTP::Post.new(uri.request_uri)
+        request["client_id"] = client_id
+        request["Authorization"] = "Bearer #{token}"
+        request["Content-Type"] = "application/json"
+        request.body = etag_map.to_json
+        response = http.request(request)
+
+        if !response.kind_of? Net::HTTPSuccess
+          UI.user_error!("Cannot merge chunks (status code: #{response.code}, body: #{response.body})")
+          return responseData
+        end
+
+        compose_json = JSON.parse(response.body)
+        if compose_json['ret']['code'] != 0
+          UI.user_error!("Merge chunks failed: #{compose_json}")
+          return responseData
+        end
+
+        UI.success("All chunks merged successfully")
+
+        # ── Step 6: Register the assembled file with AppGallery Connect ───────
+        save_app_file_info(token, client_id, app_id, upload_filename, object_id, responseData)
+      end
+
+      # Saves the uploaded file reference to the AppGallery Connect app record.
+      # Used by both the direct and multipart upload paths.
+      def self.save_app_file_info(token, client_id, app_id, upload_filename, file_dest_url, responseData)
+        UI.important("Saving app information")
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/app-file-info?appId=#{app_id}")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        request = Net::HTTP::Put.new(uri.request_uri)
+        request["client_id"] = client_id
+        request["Authorization"] = "Bearer #{token}"
+        request["Content-Type"] = "application/json"
+        request.body = { fileType: 5, files: [{ fileName: upload_filename, fileDestUrl: file_dest_url }] }.to_json
+
+        response = http.request(request)
+        if !response.kind_of? Net::HTTPSuccess
+          UI.user_error!("Cannot save app info, please check API Token / Permissions (status code: #{response.code})")
+          responseData["success"] = false
+          return responseData
+        end
+
+        result_json = JSON.parse(response.body)
+        if result_json['ret']['code'] == 0
+          UI.success("App information saved.")
+          responseData["success"] = true
+          responseData["pkgVersion"] = result_json["pkgVersion"][0]
+        else
+          UI.user_error!(result_json)
+          UI.user_error!("Failed to save app information")
+          responseData["success"] = false
+        end
+        responseData
       end
 
       def self.query_aab_compilation_status(token,params, pkgVersion)
