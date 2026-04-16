@@ -202,7 +202,7 @@ module Fastlane
 
         # ── Step 1: Initialize multipart upload ──────────────────────────────
         UI.message("Initializing multipart upload")
-        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload/multipart/init?appId=#{app_id}&fileName=#{upload_filename}")
+        uri = URI.parse("https://connect-api.cloud.huawei.com/api/publish/v2/upload/multipart/init?appId=#{app_id}&fileName=#{upload_filename}&fileType=3")
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = true
         request = Net::HTTP::Post.new(uri.request_uri)
